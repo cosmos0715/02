@@ -1,0 +1,8 @@
+{
+  "name": "Remix: 刀塔宝可梦分组器",
+  "description": "一个用于刀塔宝可梦活动的多功能分组与选人Draft工具，支持动态人数配置、高亮选人顺序、卡片自由拖拽以及人员管理。",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
