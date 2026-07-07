@@ -49,6 +49,7 @@ function MemberManagement() {
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
 
   // Form states
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -56,6 +57,8 @@ function MemberManagement() {
   const [formAvatar, setFormAvatar] = useState("⚡");
   const [formRating, setFormRating] = useState("");
   const [formRoles, setFormRoles] = useState<string[]>([]);
+  const [liveUrl, setLiveUrl] = useState("");
+  const [fetchingLive, setFetchingLive] = useState(false);
   
   // Feedback messages
   const [toast, setToast] = useState<{ type: "success" | "error"; text: string } | null>(null);
@@ -84,6 +87,43 @@ function MemberManagement() {
   const showToast = (text: string, type: "success" | "error" = "success") => {
     setToast({ text, type });
     setTimeout(() => setToast(null), 3000);
+  };
+
+  const handleFetchLiveInfo = async () => {
+    if (!liveUrl.trim()) {
+      showToast("请输入直播间链接", "error");
+      return;
+    }
+
+    try {
+      setFetchingLive(true);
+      const res = await fetch("/api/fetch-live-info", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: liveUrl.trim() })
+      });
+
+      if (!res.ok) {
+        const errData = await res.json();
+        throw new Error(errData.error || "获取直播间信息失败");
+      }
+
+      const data = await res.json();
+      if (!data.name) {
+        throw new Error("未能成功解析主播昵称");
+      }
+
+      setFormName(data.name);
+      if (data.avatar) {
+        setFormAvatar(data.avatar);
+      }
+      showToast("主播信息获取并填充成功！", "success");
+      setLiveUrl(""); // Reset link field
+    } catch (err: any) {
+      showToast(err.message || "自动获取失败，请重试或手动输入", "error");
+    } finally {
+      setFetchingLive(false);
+    }
   };
 
   const handleLoginSubmit = async (e: React.FormEvent) => {
@@ -145,6 +185,7 @@ function MemberManagement() {
     setFormAvatar(PRESET_AVATARS[0]);
     setFormRating("");
     setFormRoles([]);
+    setLiveUrl("");
   };
 
   const handleEdit = (member: Member) => {
@@ -203,10 +244,6 @@ function MemberManagement() {
   };
 
   const handleDelete = async (id: string) => {
-    if (!window.confirm("确定要删除该人员卡片吗？此操作不可逆，将从全部分组中移出。")) {
-      return;
-    }
-
     try {
       const res = await fetch("/api/members/delete", {
         method: "POST",
@@ -222,6 +259,7 @@ function MemberManagement() {
       if (editingId === id) {
         handleResetForm();
       }
+      setDeleteConfirmId(null);
     } catch (err: any) {
       showToast(err.message, "error");
     }
@@ -399,6 +437,38 @@ function MemberManagement() {
               </div>
 
               <form onSubmit={handleSubmit} className="space-y-4">
+                {/* Live Link Auto Import */}
+                <div className="bg-indigo-950/25 border border-indigo-500/20 rounded-2xl p-4 shadow-inner">
+                  <label className="block text-[11px] font-bold text-indigo-300 uppercase tracking-widest mb-2 flex items-center gap-1.5">
+                    <Sparkles className="w-4 h-4 text-cyan-300 animate-pulse" />
+                    <span>直播间链接自动获取</span>
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      type="url"
+                      value={liveUrl}
+                      onChange={(e) => setLiveUrl(e.target.value)}
+                      placeholder="输入斗鱼、B站、虎牙直播间链接..."
+                      className="flex-1 bg-black/40 border border-white/10 focus:border-indigo-500/40 rounded-xl py-2 px-3 text-white text-xs outline-none transition-all focus:ring-1 focus:ring-indigo-500/30"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleFetchLiveInfo}
+                      disabled={fetchingLive}
+                      className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-bold text-xs px-4 py-2 rounded-xl flex items-center gap-1.5 transition-colors shrink-0 shadow-lg shadow-indigo-600/10"
+                    >
+                      {fetchingLive ? (
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        "确认"
+                      )}
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-slate-500 mt-2 leading-relaxed">
+                    输入完整直播间链接后点击确认，即可自动解析并填充主播的<b>游戏昵称</b>及<b>头像</b>。
+                  </p>
+                </div>
+
                 {/* Name */}
                 <div>
                   <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1.5">
@@ -604,7 +674,7 @@ function MemberManagement() {
                         <Edit className="w-4 h-4" />
                       </button>
                       <button
-                        onClick={() => handleDelete(member.id)}
+                        onClick={() => setDeleteConfirmId(member.id)}
                         className="p-2 text-slate-400 hover:text-rose-400 bg-white/5 hover:bg-white/10 rounded-lg border border-transparent hover:border-rose-500/20 transition-all"
                         title="删除人员"
                       >
@@ -618,6 +688,60 @@ function MemberManagement() {
           </div>
         </div>
       </div>
+
+      {/* Delete Confirmation Modal */}
+      {deleteConfirmId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="w-full max-w-md bg-[#161922] border border-white/10 rounded-3xl p-6 shadow-2xl relative overflow-hidden animate-in zoom-in-95 duration-200">
+            <div className="absolute -right-6 -top-6 w-24 h-24 bg-rose-500/10 blur-2xl rounded-full"></div>
+            
+            <div className="text-center mb-6">
+              <div className="mx-auto w-12 h-12 bg-rose-500/15 border border-rose-500/30 rounded-2xl flex items-center justify-center text-rose-400 mb-4 shadow-lg shadow-rose-500/5">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <h3 className="text-xl font-extrabold tracking-tight text-white">确认删除人员卡片吗？</h3>
+              <p className="text-xs text-slate-400 mt-2 leading-relaxed">
+                此操作不可逆！删除后该选手将永久从档案库中移除，并自动从所有的分组、签到区中清除。
+              </p>
+            </div>
+
+            {(() => {
+              const memberToDelete = members.find(m => m.id === deleteConfirmId);
+              if (!memberToDelete) return null;
+              return (
+                <div className="bg-black/30 border border-white/5 rounded-2xl p-4 mb-6 flex items-center gap-3.5">
+                  <div className="w-12 h-12 bg-black/40 rounded-xl flex items-center justify-center text-2xl border border-white/5 shadow-inner overflow-hidden shrink-0">
+                    {renderAvatar(memberToDelete.avatar, "w-12 h-12")}
+                  </div>
+                  <div className="text-left">
+                    <span className="text-white font-bold block">{memberToDelete.name}</span>
+                    <span className="text-[10px] text-slate-400 font-mono block mt-1">
+                      {memberToDelete.role ? `擅长位置: ${memberToDelete.role}` : "暂未设置擅长位置"}
+                    </span>
+                  </div>
+                </div>
+              );
+            })()}
+
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={() => setDeleteConfirmId(null)}
+                className="flex-1 py-2.5 bg-white/5 hover:bg-white/10 text-slate-300 font-semibold text-sm rounded-xl border border-white/10 transition-colors cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDelete(deleteConfirmId)}
+                className="flex-1 py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-sm rounded-xl shadow-lg shadow-rose-600/20 transition-colors cursor-pointer"
+              >
+                确认删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

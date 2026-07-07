@@ -7,6 +7,28 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
 import { Member, GroupConfig, BoardState, FullState } from "./src/types.js";
+import { GoogleGenAI, Type } from "@google/genai";
+
+// Initialize Gemini lazily to prevent startup crash if API key is missing
+let aiClient: GoogleGenAI | null = null;
+function getGeminiClient() {
+  if (!aiClient) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error("GEMINI_API_KEY is not defined in environment variables");
+    }
+    aiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        }
+      }
+    });
+  }
+  return aiClient;
+}
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -377,6 +399,257 @@ app.post("/api/redo", (req, res) => {
     res.json({ success: true, ...dbState, canUndo: true, canRedo: futureStates.length > 0 });
   } else {
     res.status(400).json({ error: "Cannot redo" });
+  }
+});
+
+function parseHtmlWithRegex(html: string, url: string): { name: string; avatar: string } {
+  let name = "";
+  let avatar = "";
+
+  // 1. Try meta tags: og:image, og:title, keywords, etc.
+  const ogTitleMatch = html.match(/<meta\s+[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i) ||
+                       html.match(/<meta\s+[^>]*content=["']([^"']+)["'][^>]*property=["']og:title["']/i);
+  const ogImageMatch = html.match(/<meta\s+[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i) ||
+                       html.match(/<meta\s+[^>]*content=["']([^"']+)["'][^>]*property=["']og:image["']/i);
+
+  if (ogImageMatch) {
+    avatar = ogImageMatch[1];
+  }
+  if (ogTitleMatch) {
+    name = ogTitleMatch[1];
+  }
+
+  // 2. Fallbacks based on title tag
+  if (!name) {
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+    if (titleMatch) {
+      name = titleMatch[1];
+    }
+  }
+
+  // 3. Platform specific extraction
+  if (url.includes("huya.com")) {
+    const hostNameMatch = html.match(/<span\s+class=["']host-name["'][^>]*title=["']([^"']+)["']/i) ||
+                          html.match(/<p\s+class=["']host-title["'][^>]*title=["']([^"']+)["']/i) ||
+                          html.match(/<h1\s+class=["']host-name["'][^>]*>([^<]+)<\/h1>/i) ||
+                          html.match(/["']nick["']\s*:\s*["']([^"']+)["']/i);
+    if (hostNameMatch) {
+      name = hostNameMatch[1].trim();
+    }
+
+    const hostAvatarMatch = html.match(/["']avatar["']\s*:\s*["']([^"']+)["']/i) ||
+                            html.match(/<img\s+class=["']host-avatar["'][^>]*src=["']([^"']+)["']/i) ||
+                            html.match(/<img\s+id=["']avatarImg["'][^>]*src=["']([^"']+)["']/i);
+    if (hostAvatarMatch) {
+      avatar = hostAvatarMatch[1];
+    }
+  } else if (url.includes("bilibili.com")) {
+    const bNameMatch = html.match(/["']uname["']\s*:\s*["']([^"']+)["']/i);
+    if (bNameMatch) {
+      name = bNameMatch[1];
+    }
+    const bAvatarMatch = html.match(/["']face["']\s*:\s*["']([^"']+)["']/i);
+    if (bAvatarMatch) {
+      avatar = bAvatarMatch[1];
+    }
+  } else if (url.includes("douyu.com")) {
+    const dNameMatch = html.match(/["']nickname["']\s*:\s*["']([^"']+)["']/i) ||
+                       html.match(/["']ownerName["']\s*:\s*["']([^"']+)["']/i);
+    if (dNameMatch) {
+      name = dNameMatch[1];
+    }
+    const dAvatarMatch = html.match(/["']avatar["']\s*:\s*["']([^"']+)["']/i);
+    if (dAvatarMatch) {
+      avatar = dAvatarMatch[1];
+    }
+  }
+
+  // Clean the name
+  if (name) {
+    name = name.replace(/的(直播间|虎牙直播|虎牙直播间|哔哩哔哩直播间|B站直播间|B站|Dota2直播间|官方直播间|主页).*/i, "");
+    name = name.replace(/^【|】$/g, "");
+    name = name.replace(/^直播间：/i, "");
+    name = name.replace(/[-_]虎牙直播.*/i, "")
+               .replace(/[-_]斗鱼.*/i, "")
+               .replace(/[-_]哔哩哔哩.*/i, "")
+               .replace(/[-_]B站.*/i, "")
+               .trim();
+  }
+
+  if (avatar && avatar.startsWith("//")) {
+    avatar = "https:" + avatar;
+  }
+
+  return { name, avatar };
+}
+
+// API: Fetch streamer name and avatar automatically from Douyu, Bilibili, or Huya Live links
+app.post("/api/fetch-live-info", async (req, res) => {
+  const { url } = req.body;
+  if (!url) {
+    return res.status(400).json({ error: "请输入直播间链接" });
+  }
+
+  try {
+    let platform = "";
+    if (url.includes("bilibili.com")) {
+      platform = "bilibili";
+    } else if (url.includes("douyu.com")) {
+      platform = "douyu";
+    } else if (url.includes("huya.com")) {
+      platform = "huya";
+    } else {
+      platform = "general";
+    }
+
+    // Try API for Bilibili room first (very fast and reliable)
+    if (platform === "bilibili") {
+      const match = url.match(/live\.bilibili\.com\/(?:h5\/)?(\d+)/);
+      if (match) {
+        const roomId = match[1];
+        try {
+          const apiRes = await fetch(`https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room?roomid=${roomId}`, {
+            headers: { "User-Agent": "Mozilla/5.0" }
+          });
+          if (apiRes.ok) {
+            const apiData: any = await apiRes.json();
+            if (apiData.code === 0 && apiData.data && apiData.data.info) {
+              return res.json({
+                name: apiData.data.info.uname || "",
+                avatar: apiData.data.info.face || ""
+              });
+            }
+          }
+        } catch (apiErr) {
+          console.error("Bilibili Live User API failed, will fallback to HTML parser:", apiErr);
+        }
+      }
+    }
+
+    // Try API for Douyu room first (very fast and reliable)
+    if (platform === "douyu") {
+      const match = url.match(/douyu\.com\/(\d+)/);
+      if (match) {
+        const roomId = match[1];
+        try {
+          const apiRes = await fetch(`https://open.douyucdn.cn/api/RoomApi/room/${roomId}`, {
+            headers: { "User-Agent": "Mozilla/5.0" }
+          });
+          if (apiRes.ok) {
+            const apiData: any = await apiRes.json();
+            if (apiData.error === 0 && apiData.data) {
+              return res.json({
+                name: apiData.data.owner_name || "",
+                avatar: apiData.data.avatar || ""
+              });
+            }
+          }
+        } catch (apiErr) {
+          console.error("Douyu Room API failed, will fallback to HTML parser:", apiErr);
+        }
+      }
+    }
+
+    // Fallback or Huya room: Fetch HTML page and try regex first, then Gemini if API key is valid
+    console.log(`Fetching HTML from ${url} for extraction...`);
+    const htmlResponse = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9"
+      }
+    });
+
+    if (!htmlResponse.ok) {
+      throw new Error(`无法获取该直播间网页内容 (HTTP ${htmlResponse.status})`);
+    }
+
+    const rawHtml = await htmlResponse.text();
+
+    // 1. First, try our ultra-fast and reliable Regex parsing
+    const regexResult = parseHtmlWithRegex(rawHtml, url);
+    if (regexResult.name && regexResult.avatar) {
+      console.log("Successfully extracted streamer info using HTML regex parser:", regexResult);
+      return res.json(regexResult);
+    }
+
+    // 2. If regex only got partial, check if GEMINI_API_KEY is available to enhance it
+    const apiKey = process.env.GEMINI_API_KEY;
+    const isApiKeyValid = apiKey && apiKey !== "MY_GEMINI_API_KEY" && apiKey.trim() !== "" && !apiKey.startsWith("YOUR_");
+
+    if (isApiKeyValid) {
+      try {
+        const slicedHtml = rawHtml.slice(0, 150000); // Top 150KB contains all titles, meta tags, config scripts
+        const ai = getGeminiClient();
+        const prompt = `你是一个直播间主播信息提取专家。请分析以下来自直播平台的网页HTML内容（包含主播昵称和头像图片），精准提取出主播的个人昵称/名字，以及他的头像图片完整 URL。
+        
+网页链接为: ${url}
+
+请根据网页内容找出：
+1. 主播的个人昵称/姓名（例如：皮卡丘，Sccc，Maybe，YYF 等等。通常在 <h1 class="host-name">, <a class="room-owner">, og:title, keywords, 或 window.TT_ROOM_DATA / window.hyPlayerConfig 里）。
+2. 主播头像的完整绝对 URL 链接（必须是一个以 http:// 或 https://开头的完整图片链接，如果是 //img.abc.com... 这样的相对协议路径，请自动添加前缀 https:）。如果没有找到，请返回空字符串。
+
+网页HTML内容(截取前150KB):
+${slicedHtml}
+
+请严格按照指定的 JSON 结构返回数据。`;
+
+        const geminiRes = await ai.models.generateContent({
+          model: "gemini-3.5-flash",
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                name: { 
+                  type: Type.STRING,
+                  description: "The extracted streamer's display name or nickname."
+                },
+                avatar: { 
+                  type: Type.STRING,
+                  description: "The extracted absolute image URL for the streamer's avatar."
+                }
+              },
+              required: ["name", "avatar"]
+            }
+          }
+        });
+
+        const resultText = geminiRes.text;
+        if (resultText) {
+          const parsedResult = JSON.parse(resultText.trim());
+          let avatarUrl = parsedResult.avatar || regexResult.avatar || "";
+          if (avatarUrl && avatarUrl.startsWith("//")) {
+            avatarUrl = "https:" + avatarUrl;
+          }
+          return res.json({
+            name: parsedResult.name || regexResult.name || "新主播",
+            avatar: avatarUrl
+          });
+        }
+      } catch (geminiErr) {
+        console.error("Gemini content generation failed, will return regex results:", geminiErr);
+      }
+    } else {
+      console.warn("GEMINI_API_KEY is not defined or is a placeholder. Using regex extraction results only.");
+    }
+
+    // 3. Final fallback: If we extracted anything with regex, return that. Else, construct a decent default
+    let finalName = regexResult.name;
+    if (!finalName) {
+      const idMatch = url.match(/(?:\/live\.bilibili\.com\/|\/douyu\.com\/|\/huya\.com\/)([a-zA-Z0-9]+)/);
+      finalName = idMatch ? `主播_${idMatch[1]}` : "新录入主播";
+    }
+
+    return res.json({
+      name: finalName,
+      avatar: regexResult.avatar || "" // Let front-end fallback to dynamic avatar emojis
+    });
+
+  } catch (err: any) {
+    console.error("Fetch live info error:", err);
+    return res.status(500).json({ error: err.message || "自动获取失败" });
   }
 });
 
